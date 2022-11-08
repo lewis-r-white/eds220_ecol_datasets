@@ -1,0 +1,173 @@
+---
+title: "Exploring ecological datasets"
+author: "Lewis"
+format:
+  html:
+    code-fold:true
+    code-summary: "Show me the code!"
+editor: visual
+---
+
+
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+library(jsonlite)
+library(here)
+library(rnaturalearth)  # package that easily accesible map polygons 
+```
+
+### IUCN API
+
+Using the API, 
+
+usethis::edit_r_environ()
+
+```{r}
+iucn_token <- Sys.getenv('IUCN_KEY')
+```
+
+```{r}
+iucn_url <- 'https://apiv3.iucnredlist.org'
+
+spp_page_endpoint <- paste0(iucn_url, '/api/v3/species/page/%s?token=%s') 
+
+spp_page_url <- sprintf(spp_page_endpoint, 2, iucn_token)
+
+spp_page<- jsonlite::fromJSON(spp_page_url)
+
+spp_page_df <- spp_page$result  ### pr spp_page[['result']]
+```
+
+humpback whale: id #13006
+
+```{r}
+spp_country_endpoint <- paste0(iucn_url, '/api/v3/species/countries/id/%s?token=%s')
+
+spp_country_url <- sprintf(spp_country_endpoint, 13006, iucn_token)
+
+spp_country <- jsonlite::fromJSON(spp_country_url)
+   
+spp_country_df <- spp_country$result
+```
+
+
+## read in the data 
+
+### Read in IUCN cleaned data 
+
+```{r}
+iucn_spp_df <- read_csv(here('data/iucn_mar_mammal_info_v2021-3.csv'))
+```
+
+### Read in AquaMaps cleaned data
+
+```{r}
+am_spp_df <- read_csv(here('data/am_mammal_info_v10_2019.csv')) %>%
+  janitor::clean_names() %>%
+  rename(am_sid = species_id, iucn_sid = iucn_id)
+```
+
+### Read in AquaMaps species-cell info
+
+```{r}
+am_spp_cells_df <- read_csv(here('data/am_mammal_hcaf_cropped_v10_2019.csv')) #contains species id, cell id, and prob (probability of occurrance ~ how suitable is it for mammal)
+```
+
+
+### Read in cleaned HCAF data
+
+```{r}
+am_hcaf_df <- read_csv(here('data/am_hcaf_cropped_v7.csv'))%>%
+  janitor::clean_names()
+
+
+longlat_id_df <- am_hcaf_df %>%
+  filter(ocean_area > 0) %>%
+  select(center_long, center_lat, loiczid)
+
+
+hcaf_r <-rast(longlat_id_df, type = 'xyz', crs = 'epsg:4326')
+
+plot(hcaf_r)
+```
+
+
+## Start joining!
+
+```{r}
+id_risk_df <- iucn_spp_df %>%
+  select(iucn_sid, sciname, category) %>%
+  mutate(cat_score = case_when(category == "LC" ~ 0, 
+                               category == 'NT' ~ 1, 
+                               category == "VU" ~ 2, 
+                               category == "EN" ~ 3,
+                               category == "CR" ~ 4,
+                               category == 'EX' ~ 5,
+                               TRUE ~ NA_real_)) %>%
+  left_join(am_spp_df, by = 'iucn_sid') %>%
+  select(iucn_sid, am_sid, sciname, f_bname, category, cat_score) %>%
+  filter(!is.na(am_sid))
+
+
+risk_cells_df <- id_risk_df %>%
+  left_join(am_spp_cells_df, by = 'am_sid')
+
+```
+
+## Analysis 1: map orca suitability 
+
+```{r}
+orca_df <- risk_cells_df %>%
+  filter(sciname == "Orcinus orca")
+
+
+#substitute prob data over the other data
+orca_prop_r <- terra::subst(hcaf_r, 
+                            from = orca_df$loiczid,
+                            to = orca_df$prob, 
+                            others = NA) #any cells that don't occur in the dataset fill w/NA
+
+orca_prop_r[orca_prop_r > 1] <- NA
+
+plot(orca_prop_r, main = "Probability of occurence for Orcinus orca")
+
+```
+
+
+## Analysis 2: Species Richness
+
+```{r}
+spp_rich_df <- risk_cells_df %>%
+  filter(prob >= 0.5) %>%
+  group_by(loiczid) %>%
+  summarise(n_spp = n_distinct(am_sid))
+
+spp_rich_r <- terra::subst(hcaf_r,
+                           from = spp_rich_df$loiczid,
+                           to = spp_rich_df$n_spp, 
+                           others = NA)
+plot(spp_rich_r, main = "mammal species richness")  
+```
+
+
+## Analysis 3: average extinction risk 
+
+```{r}
+table(id_risk_df$category)
+
+mean_risk_df <- risk_cells_df %>%
+  filter(prob >= 0.5) %>%
+  group_by(loiczid) %>%
+  summarise(mean_risk = mean(cat_score, na.rm = TRUE))
+
+mean_risk_r <- subst(hcaf_r, 
+                     from = mean_risk_df$loiczid, 
+                     to = mean_risk_df$mean_risk, 
+                     others = NA)
+
+plot(mean_risk_r, main = "Mean extinction risk")
+```
+
+
